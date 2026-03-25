@@ -1,0 +1,96 @@
+name: Test Docker Buildx Digest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-digest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        run: |
+          docker buildx rm mybuilder 2>/dev/null || true
+          docker buildx create --name mybuilder --use
+          docker buildx inspect --bootstrap
+          rm -rf /tmp/.buildx-cache /tmp/.buildx-cache-new
+
+      - name: Print versions
+        run: |
+          docker version
+          docker buildx version
+          echo "---"
+          uname -a
+
+      - name: Install JFrog CLI 2.81.0
+        run: |
+          curl -fL https://releases.jfrog.io/artifactory/jfrog-cli/v2-jf/2.81.0/jfrog-cli-linux-amd64/jf -o /usr/local/bin/jf
+          chmod +x /usr/local/bin/jf
+          jf --version
+
+      - name: Configure JFrog CLI
+        env:
+          JF_URL: ${{ secrets.JF_URL }}
+          JF_USER: ${{ secrets.JF_USER }}
+          JF_PASSWORD: ${{ secrets.JF_PASSWORD }}
+        run: |
+          jf c add test-server \
+            --url=$JF_URL \
+            --user=$JF_USER \
+            --password=$JF_PASSWORD \
+            --interactive=false
+          jf c use test-server
+
+      - name: Docker Login
+        run: jf docker login --server-id test-server
+
+      - name: Build with buildx --load
+        env:
+          REGISTRY: ${{ secrets.REGISTRY }}
+          REPO: docker-402828
+          IMAGE: digest-repro-linux
+          VERSION: "1.0.0"
+        run: |
+          jf docker buildx build . \
+            --file Dockerfile \
+            --cache-from=type=local,src=/tmp/.buildx-cache \
+            --cache-to=type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            --load \
+            --provenance=false \
+            --tag $REGISTRY/$REPO/$IMAGE:$VERSION 2>&1 | tee build-output.log
+
+          echo "=== GREP DIGESTS ==="
+          grep -E "exporting (manifest|config) sha256:" build-output.log || true
+
+      - name: Push with build-info
+        env:
+          REGISTRY: ${{ secrets.REGISTRY }}
+          REPO: docker-402828
+          IMAGE: digest-repro-linux
+          VERSION: "1.0.0"
+          BUILD_NAME: digest-repro-linux-test
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          jf docker push $REGISTRY/$REPO/$IMAGE:$VERSION \
+            --build-name=$BUILD_NAME \
+            --build-number=$BUILD_NUMBER 2>&1 | tee push-output.log
+
+      - name: Publish build-info
+        env:
+          BUILD_NAME: digest-repro-linux-test
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          jf rt build-publish $BUILD_NAME $BUILD_NUMBER 2>&1 | tee publish-output.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            build-output.log
+            push-output.log
+            publish-output.log
